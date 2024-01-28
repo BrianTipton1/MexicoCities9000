@@ -1,6 +1,5 @@
 from bson import Binary
 import openrouteservice
-from uuid import uu
 import msgpack
 import json
 from itertools import combinations, islice
@@ -13,7 +12,7 @@ from pymongo import MongoClient
 CLIENT = openrouteservice.Client(base_url="http://172.21.1.3:8080/ors")
 
 def get_mongo_collection():
-    client = MongoClient('mongodb://root:example@127.0.0.1:27017/')
+    client = MongoClient('mongodb://root:example@172.21.1.9:27017/')
     db = client.routes
     return db['points']
 
@@ -61,7 +60,7 @@ def get_all_mexican_cities():
 
 
 def insert_distance_data(key, results):
-    redis_client = redis.Redis(host="127.0.0.1", port=6379, db=0)
+    redis_client = redis.Redis(host="172.21.1.9", port=6379, db=0)
     collection = get_mongo_collection()
     store_messagepack_data(collection, results['points'])
     redis_client.set(key, results['distance'])
@@ -94,7 +93,7 @@ if __name__ == "__main__":
     cities = get_all_mexican_cities()
     relevant_points = list(enumerate(super_chargers + cities))
 
-    redis_client = redis.Redis(host="127.0.0.1", port=6379, db=0)
+    redis_client = redis.Redis(host="172.21.1.9", port=6379, db=0)
     redis_client.flushall()
 
     print("")
