@@ -1,5 +1,6 @@
 from bson import Binary
 import openrouteservice
+from uuid import uuid4
 import msgpack
 import json
 from itertools import combinations, islice
@@ -11,15 +12,17 @@ from pymongo import MongoClient
 
 CLIENT = openrouteservice.Client(base_url="http://172.21.1.3:8080/ors")
 
-def get_mongo_collection():
-    client = MongoClient('mongodb://root:example@172.21.1.9:27017/')
-    db = client.routes
-    return db['points']
 
-def store_messagepack_data(collection, data):
+def get_mongo_collection():
+    client = MongoClient("mongodb://root:example@172.21.1.9:27017/")
+    db = client.routes
+    return db["points"]
+
+
+def store_messagepack_data(collection, data, key):
     serialized_data = msgpack.packb(data, use_bin_type=True)
-    
-    collection.insert_one({'0': serialized_data})
+    collection.insert_one({key: serialized_data})
+
 
 def get_location_key(index):
     return f"{index}:location"
@@ -62,8 +65,8 @@ def get_all_mexican_cities():
 def insert_distance_data(key, results):
     redis_client = redis.Redis(host="172.21.1.9", port=6379, db=0)
     collection = get_mongo_collection()
-    store_messagepack_data(collection, results['points'])
-    redis_client.set(key, results['distance'])
+    store_messagepack_data(collection, results["points"], key=key)
+    redis_client.set(key, results["distance"])
 
 
 def transform_response(raw_response):
@@ -94,7 +97,7 @@ if __name__ == "__main__":
     relevant_points = list(enumerate(super_chargers + cities))
 
     redis_client = redis.Redis(host="172.21.1.9", port=6379, db=0)
-    redis_client.flushall()
+    # redis_client.flushall()
 
     print("")
     for index, data in enumerate(relevant_points):
