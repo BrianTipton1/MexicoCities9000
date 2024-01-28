@@ -1,7 +1,20 @@
 services:
+
+    mongo:
+        image: mongo
+        restart: always
+        environment:
+          MONGO_INITDB_ROOT_USERNAME: root
+          MONGO_INITDB_ROOT_PASSWORD: example
+          MONGO_INITDB_DATABASE: routes
+        volumes:
+          - ./db/mongo:/data/db
+        ports:
+            - 27017:27017
+
     redis-stack:
         volumes:
-            - ./redis_db:/data
+            - ./db/redis:/data
         ports:
             - 6379:6379
             - 8001:8001
