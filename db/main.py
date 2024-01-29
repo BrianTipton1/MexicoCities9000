@@ -77,7 +77,11 @@ def find_value(matrix, target):
 
 
 def create_redis_key_matrix_map(lst):
-    return {f'{i}:route:{j}': (lst.index(i), lst.index(j)) for i in lst for j in lst}
+    return {f"{i}:route:{j}": (lst.index(i), lst.index(j)) for i in lst for j in lst}
+
+
+def reverse_redis_key(s):
+    return ":".join(s.split(":")[::-1])
 
 
 async def make_req(redis_client, session, pairs_chunk):
@@ -91,31 +95,35 @@ async def make_req(redis_client, session, pairs_chunk):
             )
         )
     )
-    
+
     mapping = create_redis_key_matrix_map(list(zip(*locations))[0])
     payload = get_payload(list(zip(*locations))[1])
     headers = get_headers()
 
-    async with session.post(ORS_BASE_URL, json=payload, headers=headers) as response:
+    timeout = aiohttp.ClientTimeout(total=7200)
+    async with session.post(ORS_BASE_URL, json=payload, headers=headers, timeout=timeout) as response:
         if response.status == 200:
             response_data = await response.json()
             distances_matrix = transform_response(response_data)
             if distances_matrix:
-                redis_pipeline = redis_client.pipeline()
-
-                for key, (matrix_row, matrix_column) in mapping.items():
-                    distance = distances_matrix[matrix_row][matrix_column]
-                    redis_pipeline.set(
-                        key,
-                        "NONE" if distance is None else float(distance),
-                    )
-
-                await redis_pipeline.execute()
+                asyncio.create_task(
+                    update_redis(redis_client, mapping, distances_matrix)
+                )
         else:
             response_text = await response.text()
             print(
                 f"Failed to get a successful response: {response.status} - {response_text}"
             )
+
+
+async def update_redis(redis_client, mapping, distances_matrix):
+    redis_pipeline = redis_client.pipeline()
+    for key, (matrix_row, matrix_column) in mapping.items():
+        distance = distances_matrix[matrix_row][matrix_column]
+        value = "NONE" if distance is None else float(distance)
+        redis_pipeline.set(key, value)
+        redis_pipeline.set(reverse_redis_key(key), value)
+    await redis_pipeline.execute()
 
 
 async def main():
@@ -135,7 +143,7 @@ async def main():
     ]
 
     redis_client = redis.Redis(
-        host="172.21.1.9", port=6379, db=0, decode_responses=True
+        host="127.0.0.1", port=6380, db=0, decode_responses=True
     )
 
     await redis_client.flushall()
@@ -145,7 +153,7 @@ async def main():
         await redis_client.set(get_location_key(index), packed_data)
 
     all_combinations = itertools.combinations(relevant_points, 2)
-    chunk_size = 100
+    chunk_size = 500
 
     tasks = []
     async with aiohttp.ClientSession() as session:
@@ -156,7 +164,7 @@ async def main():
             task = make_req(redis_client, session, pairs_chunk)
             tasks.append(task)
 
-            if len(tasks) >= 10:
+            if len(tasks) >= 3:
                 await asyncio.gather(*tasks)
                 tasks = []
 
