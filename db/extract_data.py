@@ -30,23 +30,22 @@ def extract_data(redis_client, key):
 
 def main():
     redis_client = redis.Redis(
-        host="127.0.0.1", port=6380, db=0, decode_responses=False
+        host="127.0.0.1", port=6379, db=0, decode_responses=False
     )
 
-    key1 = '31:location'
-    key2 = '5045:location'
+    key1 = '3'
+    key2 = '2584'
+    key1routekey2 = f'{key1}:route:{key2}'
 
     data1 = extract_data(redis_client, key1)
     data2 = extract_data(redis_client, key2)
+    tup = extract_data(redis_client, key1routekey2)
 
     # Assuming data format is [index, data_dict]
     start_gps = data1[1]['GPS']
     end_gps = data2[1]['GPS']
 
-    request_url = f"http://172.21.1.3:8080/ors/v2/directions/driving-car?start={start_gps[0]},{start_gps[1]}&end={end_gps[0]},{end_gps[1]}"
-
-    
-    # print(request_url)
+    print(tup)
     print(json.dumps(get_matrix([start_gps, end_gps])))
     print('')
 
