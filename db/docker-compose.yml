@@ -1,17 +1,4 @@
 services:
-
-    mongo:
-        image: mongo:4.4.18
-        restart: always
-        environment:
-          MONGO_INITDB_ROOT_USERNAME: root
-          MONGO_INITDB_ROOT_PASSWORD: example
-          MONGO_INITDB_DATABASE: routes
-        volumes:
-          - ./db/mongo:/data/db
-        ports:
-            - 27017:27017
-
     redis-stack:
         volumes:
             - ./db/redis:/data
