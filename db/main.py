@@ -1,7 +1,9 @@
 import itertools
+from multiprocessing import Pool
+import multiprocessing
 import aiohttp
 import msgpack
-import redis.asyncio as redis
+import redis as redis
 import json
 import asyncio
 from pandas import read_csv
@@ -51,12 +53,14 @@ def get_route_key(point_one, point_two):
     return f"{point_one}:route:{point_two}"
 
 
-def get_payload(locations):
+def get_payload(locations, srcs, dests):
     return {
         "locations": locations,
         "metrics": ["distance"],
         "resolve_locations": "false",
         "units": "km",
+        "sources": srcs,
+        "destinations": dests,
     }
 
 
@@ -76,39 +80,62 @@ def find_value(matrix, target):
     return None
 
 
-def create_redis_key_matrix_map(lst):
-    return {f"{i}:route:{j}": (lst.index(i), lst.index(j)) for i in lst for j in lst}
-
-
 def reverse_redis_key(s):
     return ":".join(s.split(":")[::-1])
 
 
-async def make_req(redis_client, session, pairs_chunk):
-    locations = list(
-        set(
-            itertools.chain.from_iterable(
-                [
-                    [(point1[0], point1[1]["GPS"]), (point2[0], point2[1]["GPS"])]
-                    for point1, point2 in pairs_chunk
-                ]
-            )
-        )
+def mutate_tuple(key, data):
+    return (key, data["GPS"])
+
+
+def get_distinct_srcs_dsts_from_chunk(chunk):
+    return map(
+        list,
+        map(
+            set,
+            zip(
+                *map(
+                    lambda src_dst: (
+                        mutate_tuple(*src_dst[0]),
+                        mutate_tuple(*src_dst[1]),
+                    ),
+                    chunk,
+                )
+            ),
+        ),
     )
 
-    mapping = create_redis_key_matrix_map(list(zip(*locations))[0])
-    payload = get_payload(list(zip(*locations))[1])
+
+def create_redis_key_matrix_map(lst, src_indices, dst_indices):
+    return {
+        f"{lst[i]}:route:{lst[j]}": (src_indices.index(i), dst_indices.index(j))
+        for i in src_indices
+        for j in dst_indices
+    }
+
+
+async def make_req(pool, session, pairs_chunk):
+    sources, destinations = get_distinct_srcs_dsts_from_chunk(pairs_chunk)
+    locations = sources + destinations
+    src_indices = list(range(0, len(sources)))
+    dest_indices = list(range(len(sources), len(destinations)))
+
+    mapping = create_redis_key_matrix_map(
+        list(zip(*locations))[0], src_indices, dest_indices
+    )
+    payload = get_payload(list(zip(*locations))[1], src_indices, dest_indices)
     headers = get_headers()
 
     timeout = aiohttp.ClientTimeout(total=7200)
-    async with session.post(ORS_BASE_URL, json=payload, headers=headers, timeout=timeout) as response:
+    async with session.post(
+        ORS_BASE_URL, json=payload, headers=headers, timeout=timeout
+    ) as response:
         if response.status == 200:
             response_data = await response.json()
             distances_matrix = transform_response(response_data)
             if distances_matrix:
-                asyncio.create_task(
-                    update_redis(redis_client, mapping, distances_matrix)
-                )
+                args = (mapping, distances_matrix)
+                pool.apply_async(update_redis_process, (args,))
         else:
             response_text = await response.text()
             print(
@@ -116,14 +143,18 @@ async def make_req(redis_client, session, pairs_chunk):
             )
 
 
-async def update_redis(redis_client, mapping, distances_matrix):
+def update_redis_process(args):
+    redis_client = redis.StrictRedis(
+        host="127.0.0.1", port=6380, db=0, decode_responses=True
+    )
+    mapping, distances_matrix = args
     redis_pipeline = redis_client.pipeline()
     for key, (matrix_row, matrix_column) in mapping.items():
         distance = distances_matrix[matrix_row][matrix_column]
         value = "NONE" if distance is None else float(distance)
         redis_pipeline.set(key, value)
         redis_pipeline.set(reverse_redis_key(key), value)
-    await redis_pipeline.execute()
+    redis_pipeline.execute()
 
 
 async def main():
@@ -142,31 +173,30 @@ async def main():
         for index, point in enumerate(all_points)
     ]
 
-    redis_client = redis.Redis(
-        host="127.0.0.1", port=6380, db=0, decode_responses=True
-    )
+    redis_client = redis.Redis(host="127.0.0.1", port=6380, db=0, decode_responses=True)
 
-    await redis_client.flushall()
+    redis_client.flushall()
 
     for index, data in enumerate(relevant_points):
         packed_data = msgpack.packb(data)
-        await redis_client.set(get_location_key(index), packed_data)
+        redis_client.set(get_location_key(index), packed_data)
 
     all_combinations = itertools.combinations(relevant_points, 2)
-    chunk_size = 500
+    chunk_size = 1000
 
     tasks = []
-    async with aiohttp.ClientSession() as session:
-        while True:
-            pairs_chunk = list(itertools.islice(all_combinations, chunk_size))
-            if not pairs_chunk:
-                break
-            task = make_req(redis_client, session, pairs_chunk)
-            tasks.append(task)
+    with Pool(processes=multiprocessing.cpu_count()) as pool:
+        async with aiohttp.ClientSession() as session:
+            while True:
+                pairs_chunk = list(itertools.islice(all_combinations, chunk_size))
+                if not pairs_chunk:
+                    break
+                task = make_req(pool, session, pairs_chunk)
+                tasks.append(task)
 
-            if len(tasks) >= 3:
-                await asyncio.gather(*tasks)
-                tasks = []
+                if len(tasks) >= 10:
+                    await asyncio.gather(*tasks)
+                    tasks = []
 
         if tasks:
             await asyncio.gather(*tasks)

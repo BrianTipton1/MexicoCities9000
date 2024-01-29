@@ -30,11 +30,11 @@ def extract_data(redis_client, key):
 
 def main():
     redis_client = redis.Redis(
-        host="127.0.0.1", port=6379, db=0, decode_responses=False
+        host="127.0.0.1", port=6380, db=0, decode_responses=False
     )
 
-    key1 = '8673:location'
-    key2 = '8383:location'
+    key1 = '31:location'
+    key2 = '5045:location'
 
     data1 = extract_data(redis_client, key1)
     data2 = extract_data(redis_client, key2)
