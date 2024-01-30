@@ -9,6 +9,8 @@ import asyncio
 from pandas import read_csv
 
 ORS_BASE_URL = "http://172.21.1.3:8080/ors/v2/matrix/driving-car"
+REDIS_IP = "127.0.0.1"
+REDIS_PORT = 6379
 
 
 def get_mexico_super_chargers() -> list:
@@ -17,8 +19,8 @@ def get_mexico_super_chargers() -> list:
     filtered_df["GPS"] = filtered_df["GPS"].apply(
         lambda x: tuple(map(float, x.split(",")))
     )
-    filtered_df["IsSuperCharger"] = True
-    return filtered_df[["City", "GPS", "IsSuperCharger"]].to_dict(orient="records")
+    filtered_df["is_super_charger"] = True
+    return filtered_df[["City", "GPS", "is_super_charger"]].to_dict(orient="records")
 
 
 def transform_response(raw_response):
@@ -38,7 +40,7 @@ def get_all_mexican_cities():
             {
                 "City": item["name"],
                 "GPS": (item["coordinates"]["lat"], item["coordinates"]["lon"]),
-                "IsSuperCharger": False,
+                "is_super_charger": False,
             }
             for item in data
         ]
@@ -47,7 +49,7 @@ def get_all_mexican_cities():
 def get_payload(locations, srcs, dests):
     return {
         "locations": locations,
-        "metrics": ["distance", 'duration'],
+        "metrics": ["distance", "duration"],
         "resolve_locations": "false",
         "units": "km",
         "sources": srcs,
@@ -62,17 +64,9 @@ def get_headers():
     }
 
 
-def find_value(matrix, target):
-    target_whole = int(target)
-    for row_index, row in enumerate(matrix):
-        for col_index, value in enumerate(row):
-            if int(value) == target_whole:
-                return row_index, col_index
-    return None
-
-
 def mutate_tuple(key, data):
-    return (key, data["GPS"])
+    return (key, data["GPS"], data["is_super_charger"])
+
 
 def get_distinct_srcs_dsts_from_chunk(chunk):
     return map(
@@ -92,9 +86,18 @@ def get_distinct_srcs_dsts_from_chunk(chunk):
     )
 
 
-def create_redis_key_matrix_map(lst, src_indices, dst_indices):
+def create_route_key(from_point, to_point):
+    return f"{from_point}:route:{to_point}"
+
+
+def create_redis_key_matrix_map(lst, src_indices, dst_indices, chargers):
     return {
-        f"{lst[i]}:route:{lst[j]}": (src_indices.index(i), dst_indices.index(j))
+        f"{create_route_key(lst[i],lst[j])}": (
+            src_indices.index(i),
+            dst_indices.index(j),
+            chargers[i],
+            chargers[j],
+        )
         for i in src_indices
         for j in dst_indices
     }
@@ -106,10 +109,11 @@ async def make_req(pool, session, pairs_chunk):
     src_indices = list(range(0, len(sources)))
     dest_indices = list(range(len(sources), len(destinations)))
 
+    all_redis_keys, all_points, chargers = list(zip(*locations))
     mapping = create_redis_key_matrix_map(
-        list(zip(*locations))[0], src_indices, dest_indices
+        all_redis_keys, src_indices, dest_indices, chargers
     )
-    payload = get_payload(list(zip(*locations))[1], src_indices, dest_indices)
+    payload = get_payload(all_points, src_indices, dest_indices)
     headers = get_headers()
 
     timeout = aiohttp.ClientTimeout(total=7200)
@@ -129,31 +133,86 @@ async def make_req(pool, session, pairs_chunk):
             )
 
 
-def update_redis_process(args):
-    redis_client = redis.StrictRedis(
-        host="127.0.0.1", port=6379, db=0, decode_responses=True
+def create_packed_route(
+    distance, duration, src_db, dst_db, src_is_charger, dst_is_charger
+):
+    return msgpack.packb(
+        {
+            "dist": distance,
+            "dur": duration,
+            "s_db": src_db,
+            "d_db": dst_db,
+            "s_charges": src_is_charger,
+            "d_charges": dst_is_charger,
+        }
     )
+
+
+def split_route_key(route_str):
+    return route_str.split(":")
+
+
+def create_pipelines():
+    clients = [
+        redis.StrictRedis(host=REDIS_IP, port=REDIS_PORT, db=i, decode_responses=True)
+        for i in range(0, 16)
+    ]
+    return zip(*map(lambda client: (client.pipeline(), client), clients))
+
+
+def update_redis_process(args):
     mapping, distances_matrix, durations_matrix = args
-    redis_pipeline = redis_client.pipeline()
-    for key, (matrix_row, matrix_column) in mapping.items():
+    pipelines, _ = create_pipelines()
+    for route, (
+        matrix_row,
+        matrix_column,
+        src_is_charger,
+        dst_is_charger,
+    ) in mapping.items():
         maybe_distance = distances_matrix[matrix_row][matrix_column]
         maybe_duration = durations_matrix[matrix_row][matrix_column]
 
-        data = '' if maybe_distance is None or maybe_distance is None else (maybe_distance, maybe_duration)
+        src_key, _, dest_key = split_route_key(route)
+        src_db = str_mod_db_num(src_key)
+        dst_db = str_mod_db_num(dest_key)
 
-        redis_pipeline.set(key, msgpack.packb(data))
+        data = (
+            ""
+            if maybe_distance is None or maybe_duration is None
+            else create_packed_route(
+                distance=maybe_distance,
+                duration=maybe_duration,
+                src_db=src_db,
+                dst_db=dst_db,
+                src_is_charger=src_is_charger,
+                dst_is_charger=dst_is_charger,
+            )
+        )
 
-    redis_pipeline.execute()
+        pipelines[src_db].set(route, data)
+    [pipeline.execute() for pipeline in (pipelines)]
 
 
-def init_redis(relevant_points):
-    redis_client = redis.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=True)
-    redis_client.flushall()
-
-    for index, data in enumerate(relevant_points):
-        packed_data = msgpack.packb(data)
-        redis_client.set(f"{index}", packed_data)
-        redis_client.set(f"{index}:route:{index}", msgpack.packb((0, 0)))
+def init_redis(relevant_points, flush=True):
+    _, clients = create_pipelines()
+    if flush:
+        [client.flushall() for client in clients]
+    for index, data in relevant_points:
+        packed_location_data = msgpack.packb(data)
+        clients[0].set(f"{index}", packed_location_data)
+        db_index = str_mod_db_num(index)
+        is_charger = data["is_super_charger"]
+        clients[0].set(
+            create_route_key(index, index),
+            create_packed_route(
+                distance=0,
+                duration=0,
+                src_db=db_index,
+                dst_db=db_index,
+                src_is_charger=is_charger,
+                dst_is_charger=is_charger,
+            ),
+        )
 
 
 def get_relevant_points(all_points):
@@ -163,11 +222,15 @@ def get_relevant_points(all_points):
             {
                 "City": point["City"],
                 "GPS": (point["GPS"][1], point["GPS"][0]),
-                "IsSuperCharger": point["IsSuperCharger"],
+                "is_super_charger": point["is_super_charger"],
             },
         )
         for index, point in enumerate(all_points)
     ]
+
+
+def str_mod_db_num(s):
+    return int(s) % 16
 
 
 async def main():
