@@ -133,36 +133,25 @@ async def make_req(pool, session, pairs_chunk):
             )
 
 
-def create_packed_route(
-    distance, duration, src_db, dst_db, src_is_charger, dst_is_charger
-):
+def create_packed_route(distance, duration, src_is_charger, dst_is_charger):
     return msgpack.packb(
         {
             "dist": distance,
             "dur": duration,
-            "s_db": src_db,
-            "d_db": dst_db,
             "s_charges": src_is_charger,
             "d_charges": dst_is_charger,
         }
     )
 
 
-def split_route_key(route_str):
-    return route_str.split(":")
-
-
-def create_pipelines():
-    clients = [
-        redis.StrictRedis(host=REDIS_IP, port=REDIS_PORT, db=i, decode_responses=True)
-        for i in range(0, 16)
-    ]
-    return zip(*map(lambda client: (client.pipeline(), client), clients))
-
 
 def update_redis_process(args):
     mapping, distances_matrix, durations_matrix = args
-    pipelines, _ = create_pipelines()
+    client = redis.Redis(
+        host=REDIS_IP, port=REDIS_PORT, db=0, decode_responses=True
+    )
+    pipeline = client.pipeline()
+
     for route, (
         matrix_row,
         matrix_column,
@@ -171,48 +160,44 @@ def update_redis_process(args):
     ) in mapping.items():
         maybe_distance = distances_matrix[matrix_row][matrix_column]
         maybe_duration = durations_matrix[matrix_row][matrix_column]
-
-        src_key, _, dest_key = split_route_key(route)
-        src_db = str_mod_db_num(src_key)
-        dst_db = str_mod_db_num(dest_key)
-
         data = (
             ""
             if maybe_distance is None or maybe_duration is None
             else create_packed_route(
                 distance=maybe_distance,
                 duration=maybe_duration,
-                src_db=src_db,
-                dst_db=dst_db,
                 src_is_charger=src_is_charger,
                 dst_is_charger=dst_is_charger,
             )
         )
 
-        pipelines[src_db].set(route, data)
-    [pipeline.execute() for pipeline in (pipelines)]
+        pipeline.set(route, data)
+    pipeline.execute()
 
 
 def init_redis(relevant_points, flush=True):
-    _, clients = create_pipelines()
+    client = redis.Redis(
+        host=REDIS_IP, port=REDIS_PORT, db=0, decode_responses=True
+    )
+    pipeline = client.pipeline()
     if flush:
-        [client.flushall() for client in clients]
+        client.flushall()
     for index, data in relevant_points:
         packed_location_data = msgpack.packb(data)
-        clients[0].set(f"{index}", packed_location_data)
-        db_index = str_mod_db_num(index)
+        client.set(f"{index}", packed_location_data)
         is_charger = data["is_super_charger"]
-        clients[0].set(
+        pipeline.set(
             create_route_key(index, index),
             create_packed_route(
                 distance=0,
                 duration=0,
-                src_db=db_index,
-                dst_db=db_index,
                 src_is_charger=is_charger,
                 dst_is_charger=is_charger,
             ),
         )
+    pipeline.execute()
+    pipeline.close()
+    client.close()
 
 
 def get_relevant_points(all_points):
@@ -227,11 +212,6 @@ def get_relevant_points(all_points):
         )
         for index, point in enumerate(all_points)
     ]
-
-
-def str_mod_db_num(s):
-    return int(s) % 16
-
 
 async def main():
     super_chargers = get_mexico_super_chargers()
